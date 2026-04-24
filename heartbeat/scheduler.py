@@ -69,14 +69,6 @@ class Scheduler:
                         "Open the app and click Run Now, or re-save the password.",
                         job.name,
                     )
-                    # Bump last_run so we don't spin-log every tick.
-                    job.last_run = time.time()
-                    continue
-                if not job.save_password:
-                    log.info(
-                        "Job '%s' is due, but it's set to prompt for a password. "
-                        "Open the app to run it.", job.name,
-                    )
                     job.last_run = time.time()
                     continue
 

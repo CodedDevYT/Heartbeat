@@ -1230,9 +1230,9 @@ class RestoreTab(QWidget):
     def _populate_versions(self) -> None:
         """Fill the versions table from the vault's snapshot list.
 
-        Only the snapshot IDs are read here (a fast directory glob).
-        Full manifests are loaded lazily when the user selects a row,
-        avoiding a multi-second freeze on vaults with many snapshots.
+        Each snapshot manifest is decrypted and cached so that the mode,
+        file count, and size columns are visible immediately without
+        requiring the user to click each row first.
 
         Each row stores the snapshot ID in the first column's UserRole
         data so that lookups remain correct even if the table is sorted.
@@ -1245,19 +1245,21 @@ class RestoreTab(QWidget):
         # Block signals while we fill the table so that
         # itemSelectionChanged doesn't fire for every intermediate
         # state (setRowCount, setSortingEnabled, etc.).  Without this,
-        # each spurious signal triggers a full snapshot decrypt + file
-        # table render, freezing the UI on vaults with many versions.
+        # each spurious signal triggers a full file-table render,
+        # freezing the UI on vaults with many versions.
         t.blockSignals(True)
         t.setSortingEnabled(False)
         t.setUpdatesEnabled(False)
         t.setRowCount(len(ids))
         for i, sid in enumerate(ids):
+            snap = self._load_snapshot(sid)
+            kind = "Quick" if snap.kind == "incremental" else "Complete"
             when_item = QTableWidgetItem(format_snapshot_id(sid))
             when_item.setData(Qt.UserRole, sid)
             t.setItem(i, 0, when_item)
-            t.setItem(i, 1, QTableWidgetItem("—"))
-            t.setItem(i, 2, QTableWidgetItem("—"))
-            t.setItem(i, 3, QTableWidgetItem("—"))
+            t.setItem(i, 1, QTableWidgetItem(kind))
+            t.setItem(i, 2, QTableWidgetItem(str(len(snap.entries))))
+            t.setItem(i, 3, QTableWidgetItem(format_size(snap.total_size())))
         t.setUpdatesEnabled(True)
         t.setSortingEnabled(True)
         t.blockSignals(False)
@@ -2189,9 +2191,10 @@ class MainWindow(QMainWindow):
         back to the UI via Qt Signals using QueuedConnection.
     """
 
-    # Signal to bounce scheduled backups from the scheduler's background
+    # Signals to bounce scheduled backups from the scheduler's background
     # thread onto the UI thread (Qt handles the cross-thread delivery).
-    _scheduled_fire = Signal(BackupJob, str)
+    _scheduled_fire = Signal(BackupJob, str)    # job + password
+    _scheduled_prompt = Signal(object)           # job (needs password dialog)
 
     def __init__(self) -> None:
         super().__init__()
@@ -2308,8 +2311,10 @@ class MainWindow(QMainWindow):
 
         self._sched_worker = None
         self._sched_thread = None
+        self._prompt_pending = False
         self.scheduler = Scheduler(self.config, runner=self._scheduled_run)
         self._scheduled_fire.connect(self._fire_scheduled_backup)
+        self._scheduled_prompt.connect(self._prompt_scheduled_password)
         self.scheduler.start()
 
         # Menu bar — built last so it can reference tabs/dialogs.
@@ -2516,13 +2521,34 @@ class MainWindow(QMainWindow):
 
     def _scheduled_run(self, job: BackupJob, password: str | None) -> None:
         """Called on the scheduler thread. Bounce onto the UI thread to
-        actually open the vault and start the backup worker."""
-        if password is None:
-            log.info("Scheduler skipped '%s' — no stored password.", job.name)
-            job.last_run = time.time()
+        actually open the vault and start the backup worker.
+
+        If no password is available (job doesn't save to keychain),
+        we prompt the user via a dialog on the UI thread.
+        """
+        if password is not None:
+            self._scheduled_fire.emit(job, password)
+        else:
+            self._scheduled_prompt.emit(job)
+
+    def _prompt_scheduled_password(self, job: BackupJob) -> None:
+        """UI-thread handler: show a password dialog for a scheduled job
+        that doesn't have a stored password.  If the user provides one,
+        hand it off to _fire_scheduled_backup.  If they cancel, bump
+        last_run so the scheduler doesn't re-prompt on the next tick."""
+        if self._prompt_pending:
             return
-        # Qt auto-delivers cross-thread signals via the target's event loop.
-        self._scheduled_fire.emit(job, password)
+        self._prompt_pending = True
+        self._bring_to_front()
+        pw = PasswordDialog.ask(
+            self, vault_name=f"Scheduled: '{job.name}' — {job.repo}")
+        self._prompt_pending = False
+        if pw is None:
+            job.last_run = time.time()
+            self._append_log(
+                f"Scheduler: '{job.name}' skipped — no password provided.")
+            return
+        self._fire_scheduled_backup(job, pw)
 
     def _fire_scheduled_backup(self, job: BackupJob, password: str) -> None:
         """UI-thread handler: run a scheduled job in the background.
