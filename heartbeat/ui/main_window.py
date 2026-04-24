@@ -1289,28 +1289,20 @@ class RestoreTab(QWidget):
     def _load_files_for_selected(self) -> None:
         """Called when the user clicks a row in the versions table.
         Loads the snapshot manifest (from cache if available) and
-        fills the files table with its entries."""
+        fills the files table with its entries.
+
+        Note: version stats (mode, files, size) are already filled by
+        _populate_versions, so we only need to render the file list.
+        We must NOT call setText on the versions table here — doing so
+        while sorting is enabled triggers a re-sort which fires
+        itemSelectionChanged again, causing infinite recursion.
+        """
         if self._repo is None:
             return
         sid = self._selected_snapshot_id()
         if sid is None:
             return
         snap = self._load_snapshot(sid)
-
-        # Back-fill the version row with details now that we have them.
-        rows = self.versions_table.selectionModel().selectedRows()
-        if not rows:
-            return
-        row = rows[0].row()
-        t = self.versions_table
-        kind = "Quick" if snap.kind == "incremental" else "Complete"
-        for col, text in ((1, kind),
-                          (2, str(len(snap.entries))),
-                          (3, format_size(snap.total_size()))):
-            cell = t.item(row, col)
-            if cell is not None:
-                cell.setText(text)
-
         self._current_entries = list(snap.entries)
         self._render_files(self._current_entries)
 
