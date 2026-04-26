@@ -73,6 +73,7 @@ class Scheduler:
                     continue
 
                 log.info("Scheduler triggering job %s", job.name)
+                job.last_run = time.time()
                 try:
                     self.runner(job, password)
                 except Exception as e:

@@ -4,10 +4,10 @@ This script is the single entry point for both the graphical UI and the
 command-line interface:
 
     heartbeat                                       # GUI (default)
-    heartbeat --cli init /path/to/repo              # CLI — create vault
-    heartbeat --cli backup /path/to/repo /src       # CLI — run backup
-    heartbeat --cli snapshots /path/to/repo         # CLI — list versions
-    heartbeat --cli restore /repo <id> /dest        # CLI — restore files
+    heartbeat --cli init vault.hbv                  # CLI — create vault
+    heartbeat --cli backup vault.hbv /src           # CLI — run backup
+    heartbeat --cli snapshots vault.hbv             # CLI — list versions
+    heartbeat --cli restore vault.hbv <id> /dest    # CLI — restore files
 
 The GUI depends on PySide6. If PySide6 isn't installed the script prints a
 friendly error message instead of a traceback, and suggests the CLI fallback.

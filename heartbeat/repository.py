@@ -1,31 +1,30 @@
-"""On-disk repository layout.
+"""Single-file encrypted vault backed by SQLite.
 
-A repository is a directory that Heartbeat owns entirely. Layout:
+A vault is a single ``.hbv`` file (an SQLite database) containing three
+tables:
 
-    <repo>/
-        repo.json                # metadata + KDF params + verifier (unencrypted container,
-                                 # but the verifier inside is encrypted so the password can
-                                 # be checked without storing it)
-        objects/
-            ab/
-                cdef...          # encrypted file contents, named by sha256 of PLAINTEXT
-        snapshots/
-            2026-04-22T12-00-00.snap   # encrypted Snapshot manifest
+    meta       — key-value pairs: KDF salt, iteration count, password verifier
+    objects    — content-addressed encrypted file blobs, keyed by SHA-256
+    snapshots  — encrypted snapshot manifests, keyed by timestamp ID
+
+Using SQLite gives us:
+    - A single file on disk that's easy to browse for and move around.
+    - Atomic writes (WAL journal mode) so a crash can't corrupt the vault.
+    - Efficient random access to individual objects without extracting the
+      whole archive.
 
 Objects are content-addressed on the *plaintext* hash, which means:
-    - if two files are identical, they're stored once → free dedup
-    - an incremental backup that adds one file only writes one object
-    - if an object already exists we can skip re-encrypting entirely
+    - Identical files are stored once (free dedup).
+    - An incremental backup that adds one file writes one new object.
+    - If an object already exists we skip re-encrypting entirely.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 from . import crypto
 from .logger import get_logger
@@ -33,13 +32,14 @@ from .manifest import Snapshot
 
 log = get_logger(__name__)
 
-# ── Repository layout constants ────────────────────────────────────────────
-# These names are committed to on disk; changing them would break existing repos.
+REPO_VERSION = 2
+VAULT_EXTENSION = ".hbv"
 
-REPO_VERSION = 1              # Bump when the on-disk format changes
-REPO_METADATA_FILE = "repo.json"   # Stores KDF salt, iterations, and verifier
-OBJECTS_DIR = "objects"        # Content-addressed encrypted file blobs
-SNAPSHOTS_DIR = "snapshots"    # Encrypted snapshot manifests
+_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS objects (sha256 TEXT PRIMARY KEY, data BLOB);
+CREATE TABLE IF NOT EXISTS snapshots (snapshot_id TEXT PRIMARY KEY, data BLOB);
+"""
 
 
 class RepositoryError(Exception):
@@ -50,7 +50,7 @@ class RepositoryError(Exception):
 class RepoMetadata:
     version: int
     kdf: crypto.KdfParams
-    verifier_hex: str  # encrypted known plaintext
+    verifier_hex: str
 
     def to_dict(self) -> dict:
         return {
@@ -69,148 +69,165 @@ class RepoMetadata:
 
 
 class Repository:
-    """Encrypted backup repository.
+    """Encrypted backup vault stored as a single .hbv file.
 
     Open in one of two ways:
-        Repository.initialize(path, password)   # create a new repo
-        Repository.open(path, password)         # open an existing repo
+        Repository.initialize(path, password)   # create a new vault
+        Repository.open(path, password)          # open an existing vault
     """
 
-    def __init__(self, root: Path, meta: RepoMetadata, key: bytes) -> None:
-        self.root = Path(root)
+    def __init__(self, path: Path, meta: RepoMetadata, key: bytes,
+                 conn: sqlite3.Connection) -> None:
+        self.path = Path(path)
         self.meta = meta
         self._key = key
+        self._conn = conn
 
     # --- lifecycle ---------------------------------------------------------
 
     @classmethod
-    def initialize(cls, root: Path | str, password: str) -> "Repository":
-        """Create a brand-new repository (vault) on disk.
-
-        Steps:
-          1. Create the directory structure (objects/ + snapshots/).
-          2. Generate a fresh random salt for key derivation.
-          3. Derive the encryption key from the password.
-          4. Encrypt a known plaintext as a "verifier" — this is how
-             we check the password on future opens without storing it.
-          5. Write repo.json with the salt + verifier (NOT the password).
-        """
-        root = Path(root)
-        if root.exists() and any(root.iterdir()):
-            raise RepositoryError(f"Cannot initialize: {root} is not empty.")
-        root.mkdir(parents=True, exist_ok=True)
-        (root / OBJECTS_DIR).mkdir(exist_ok=True)
-        (root / SNAPSHOTS_DIR).mkdir(exist_ok=True)
-
-        kdf = crypto.KdfParams.new()          # random salt
-        key = crypto.derive_key(password, kdf) # slow on purpose (PBKDF2)
-        verifier = crypto.make_verifier(key)   # encrypted known plaintext
-        meta = RepoMetadata(version=REPO_VERSION, kdf=kdf, verifier_hex=verifier.hex())
-
-        (root / REPO_METADATA_FILE).write_text(
-            json.dumps(meta.to_dict(), indent=2), encoding="utf-8"
-        )
-        log.info("Initialized repository at %s", root)
-        return cls(root, meta, key)
+    def _ensure_extension(cls, path: Path) -> Path:
+        if path.suffix.lower() != VAULT_EXTENSION:
+            path = path.with_suffix(VAULT_EXTENSION)
+        return path
 
     @classmethod
-    def open(cls, root: Path | str, password: str) -> "Repository":
-        """Open an existing repository by re-deriving the key from the
-        password and verifying it against the stored verifier.
+    def initialize(cls, path: Path | str, password: str) -> "Repository":
+        """Create a brand-new vault file.
 
-        If the password is wrong, check_verifier() will fail (the GCM
-        tag won't match) and we raise RepositoryError instead of
-        returning a repo with a bad key that would corrupt data.
+        Generates a random salt, derives the encryption key, encrypts a
+        known plaintext as a verifier (so we can check the password on
+        future opens without storing it), and writes everything into a
+        fresh SQLite database.
         """
-        root = Path(root)
-        meta_path = root / REPO_METADATA_FILE
-        if not meta_path.exists():
-            raise RepositoryError(f"No repository at {root}")
-        meta = RepoMetadata.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
-        if meta.version != REPO_VERSION:
-            raise RepositoryError(f"Unsupported repo version: {meta.version}")
+        path = cls._ensure_extension(Path(path))
+        if path.exists():
+            raise RepositoryError(f"Cannot create vault: {path} already exists.")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA)
+
+        kdf = crypto.KdfParams.new()
+        key = crypto.derive_key(password, kdf)
+        verifier = crypto.make_verifier(key)
+        meta = RepoMetadata(version=REPO_VERSION, kdf=kdf,
+                            verifier_hex=verifier.hex())
+
+        conn.execute("INSERT INTO meta VALUES (?, ?)",
+                     ("repo", json.dumps(meta.to_dict())))
+        conn.commit()
+        log.info("Created vault at %s", path)
+        return cls(path, meta, key, conn)
+
+    @classmethod
+    def open(cls, path: Path | str, password: str) -> "Repository":
+        """Open an existing vault by re-deriving the key and verifying it
+        against the stored verifier."""
+        path = Path(path)
+        if not path.exists():
+            raise RepositoryError(f"No vault at {path}")
+
+        try:
+            conn = sqlite3.connect(str(path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'repo'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise RepositoryError(f"Not a valid vault file: {path}") from exc
+
+        if not row:
+            conn.close()
+            raise RepositoryError(f"Not a valid vault file: {path}")
+
+        meta = RepoMetadata.from_dict(json.loads(row[0]))
         key = crypto.derive_key(password, meta.kdf)
         if not crypto.check_verifier(key, bytes.fromhex(meta.verifier_hex)):
+            conn.close()
             raise RepositoryError("Invalid password.")
-        log.info("Opened repository at %s", root)
-        return cls(root, meta, key)
+        log.info("Opened vault at %s", path)
+        return cls(path, meta, key, conn)
+
+    @classmethod
+    def is_vault(cls, path: Path | str) -> bool:
+        """Quick check whether a file looks like a Heartbeat vault."""
+        path = Path(path)
+        if not path.is_file():
+            return False
+        try:
+            conn = sqlite3.connect(str(path))
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'repo'"
+            ).fetchone()
+            conn.close()
+            return row is not None
+        except Exception:
+            return False
 
     # --- object store ------------------------------------------------------
 
-    def _object_path(self, sha256_hex: str) -> Path:
-        """Map a hex hash to a file path under ``objects/``.
-
-        We split the hash into a 2-char prefix directory + the rest,
-        exactly like Git does (``objects/ab/cdef…``).  This avoids putting
-        thousands of files in a single directory, which would slow down
-        file-system lookups on older filesystems.
-        """
-        return self.root / OBJECTS_DIR / sha256_hex[:2] / sha256_hex[2:]
-
     def has_object(self, sha256_hex: str) -> bool:
-        return self._object_path(sha256_hex).exists()
+        row = self._conn.execute(
+            "SELECT 1 FROM objects WHERE sha256 = ?", (sha256_hex,)
+        ).fetchone()
+        return row is not None
 
     def put_object_from_file(self, src_path: Path | str, sha256_hex: str) -> bool:
-        """Encrypt `src_path` and store it under `sha256_hex`.
-
-        Returns True if written, False if object already existed (dedup).
-
-        Uses a write-to-tmp-then-rename pattern: the encrypted data is
-        first written to a .tmp file, then atomically renamed into place
-        with os.replace(). This prevents a half-written file from
-        corrupting the repo if the app crashes mid-write.
-        """
-        dest = self._object_path(sha256_hex)
-        if dest.exists():
-            return False          # dedup — already have this content
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".tmp")
-        try:
-            crypto.encrypt_stream(self._key, src_path, tmp)
-            os.replace(tmp, dest)  # atomic rename
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+        """Encrypt a file and store it. Returns True if written, False if
+        the object already existed (dedup)."""
+        if self.has_object(sha256_hex):
+            return False
+        with open(str(src_path), "rb") as f:
+            plaintext = f.read()
+        encrypted = crypto.encrypt_bytes(self._key, plaintext)
+        self._conn.execute(
+            "INSERT INTO objects (sha256, data) VALUES (?, ?)",
+            (sha256_hex, encrypted),
+        )
+        self._conn.commit()
         return True
 
     def get_object_to_file(self, sha256_hex: str, dest_path: Path | str) -> None:
-        src = self._object_path(sha256_hex)
-        if not src.exists():
+        """Decrypt an object and write it to a file on disk."""
+        row = self._conn.execute(
+            "SELECT data FROM objects WHERE sha256 = ?", (sha256_hex,)
+        ).fetchone()
+        if not row:
             raise RepositoryError(f"Missing object {sha256_hex}")
-        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
-        crypto.decrypt_stream(self._key, src, dest_path)
+        plaintext = crypto.decrypt_bytes(self._key, row[0])
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(plaintext)
 
     # --- snapshots ---------------------------------------------------------
 
-    def _snapshot_path(self, snapshot_id: str) -> Path:
-        return self.root / SNAPSHOTS_DIR / f"{snapshot_id}.snap"
-
-    def save_snapshot(self, snap: Snapshot) -> Path:
-        path = self._snapshot_path(snap.snapshot_id)
-        blob = crypto.encrypt_bytes(self._key, snap.to_json())
-        path.write_bytes(blob)
-        log.info("Saved snapshot %s (%d files)", snap.snapshot_id, len(snap.entries))
-        return path
+    def save_snapshot(self, snap: Snapshot) -> None:
+        data = crypto.encrypt_bytes(self._key, snap.to_json())
+        self._conn.execute(
+            "INSERT OR REPLACE INTO snapshots (snapshot_id, data) VALUES (?, ?)",
+            (snap.snapshot_id, data),
+        )
+        self._conn.commit()
+        log.info("Saved snapshot %s (%d files)", snap.snapshot_id,
+                 len(snap.entries))
 
     def load_snapshot(self, snapshot_id: str) -> Snapshot:
-        path = self._snapshot_path(snapshot_id)
-        if not path.exists():
+        row = self._conn.execute(
+            "SELECT data FROM snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if not row:
             raise RepositoryError(f"No snapshot: {snapshot_id}")
-        data = crypto.decrypt_bytes(self._key, path.read_bytes())
+        data = crypto.decrypt_bytes(self._key, row[0])
         return Snapshot.from_json(data)
 
     def list_snapshots(self) -> list[str]:
-        d = self.root / SNAPSHOTS_DIR
-        if not d.exists():
-            return []
-        return sorted(p.stem for p in d.glob("*.snap"))
-
-    def iter_snapshots(self) -> Iterator[Snapshot]:
-        for sid in self.list_snapshots():
-            yield self.load_snapshot(sid)
+        rows = self._conn.execute(
+            "SELECT snapshot_id FROM snapshots ORDER BY snapshot_id"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def latest_snapshot(self) -> Snapshot | None:
         ids = self.list_snapshots()
@@ -219,15 +236,18 @@ class Repository:
     # --- misc --------------------------------------------------------------
 
     def disk_usage(self) -> int:
-        total = 0
-        for dirpath, _, filenames in os.walk(self.root):
-            for f in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, f))
-                except OSError:
-                    pass
-        return total
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
 
     def destroy(self) -> None:
-        """Delete the repository. Irreversible."""
-        shutil.rmtree(self.root)
+        """Delete the vault file. Irreversible."""
+        self.close()
+        self.path.unlink(missing_ok=True)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass

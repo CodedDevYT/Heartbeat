@@ -1,11 +1,11 @@
 """Command-line interface — fallback when no UI is desired.
 
 Usage:
-    heartbeat --cli init   <repo>
-    heartbeat --cli backup <repo> <source> [--full] [--ignore-hidden]
-    heartbeat --cli restore <repo> <snapshot_id> <dest> [--path PREFIX] [--overwrite]
-    heartbeat --cli snapshots <repo>
-    heartbeat --cli list    <repo> <snapshot_id>
+    heartbeat --cli init   <vault.hbv>
+    heartbeat --cli backup <vault.hbv> <source> [--full] [--ignore-hidden]
+    heartbeat --cli restore <vault.hbv> <snapshot_id> <dest> [--path PREFIX] [--overwrite]
+    heartbeat --cli snapshots <vault.hbv>
+    heartbeat --cli list    <vault.hbv> <snapshot_id>
 
 Passwords are prompted with getpass so they don't appear in shell history.
 """
@@ -26,9 +26,9 @@ log = get_logger(__name__)
 
 
 def _prompt_password(confirm: bool = False) -> str:
-    pw = getpass.getpass("Repository password: ")
+    pw = getpass.getpass("Vault password: ")
     if confirm:
-        pw2 = getpass.getpass("Confirm password:     ")
+        pw2 = getpass.getpass("Confirm password: ")
         if pw != pw2:
             print("Passwords do not match.", file=sys.stderr)
             sys.exit(2)
@@ -55,18 +55,18 @@ def _print_restore_progress(p: RestoreProgress) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     pw = _prompt_password(confirm=True)
     try:
-        Repository.initialize(Path(args.repo), pw)
+        Repository.initialize(Path(args.vault), pw)
     except RepositoryError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
-    print(f"Initialized repository at {args.repo}")
+    print(f"Created vault at {args.vault}")
     return 0
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
     pw = _prompt_password()
     try:
-        repo = Repository.open(Path(args.repo), pw)
+        repo = Repository.open(Path(args.vault), pw)
     except RepositoryError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -79,7 +79,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         progress_cb=_print_backup_progress,
         ignore_hidden=args.ignore_hidden,
     )
-    print()  # newline after the progress line
+    print()
     print(f"Snapshot {result.snapshot_id}: {result.files} files, "
           f"{result.new_objects} new / {result.reused_objects} reused, "
           f"{result.duration_seconds:.1f}s")
@@ -93,7 +93,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
 def cmd_restore(args: argparse.Namespace) -> int:
     pw = _prompt_password()
     try:
-        repo = Repository.open(Path(args.repo), pw)
+        repo = Repository.open(Path(args.vault), pw)
     except RepositoryError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -118,7 +118,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
 def cmd_snapshots(args: argparse.Namespace) -> int:
     pw = _prompt_password()
-    repo = Repository.open(Path(args.repo), pw)
+    repo = Repository.open(Path(args.vault), pw)
     ids = repo.list_snapshots()
     if not ids:
         print("(no snapshots)")
@@ -132,7 +132,7 @@ def cmd_snapshots(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     pw = _prompt_password()
-    repo = Repository.open(Path(args.repo), pw)
+    repo = Repository.open(Path(args.vault), pw)
     snap = repo.load_snapshot(args.snapshot_id)
     for entry in snap.entries:
         print(f"{entry.size:12}  {entry.path}")
@@ -143,34 +143,38 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="Heartbeat", description="Heartbeat — encrypted backup tool.")
+    p = argparse.ArgumentParser(
+        prog="Heartbeat",
+        description="Heartbeat — encrypted backup tool.",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("init", help="Create a new repository.")
-    sp.add_argument("repo")
+    sp = sub.add_parser("init", help="Create a new vault.")
+    sp.add_argument("vault", help="Path for the new .hbv vault file")
     sp.set_defaults(func=cmd_init)
 
-    sp = sub.add_parser("backup", help="Back up a source folder into a repository.")
-    sp.add_argument("repo")
+    sp = sub.add_parser("backup", help="Back up a source folder into a vault.")
+    sp.add_argument("vault", help="Path to the .hbv vault file")
     sp.add_argument("source")
     sp.add_argument("--full", action="store_true", help="Force a full backup.")
     sp.add_argument("--ignore-hidden", action="store_true")
     sp.set_defaults(func=cmd_backup)
 
     sp = sub.add_parser("restore", help="Restore files from a snapshot.")
-    sp.add_argument("repo")
+    sp.add_argument("vault", help="Path to the .hbv vault file")
     sp.add_argument("snapshot_id")
     sp.add_argument("dest")
-    sp.add_argument("--path", default=None, help="Restore only entries under this prefix.")
+    sp.add_argument("--path", default=None,
+                    help="Restore only entries under this prefix.")
     sp.add_argument("--overwrite", action="store_true")
     sp.set_defaults(func=cmd_restore)
 
-    sp = sub.add_parser("snapshots", help="List snapshots in a repository.")
-    sp.add_argument("repo")
+    sp = sub.add_parser("snapshots", help="List snapshots in a vault.")
+    sp.add_argument("vault", help="Path to the .hbv vault file")
     sp.set_defaults(func=cmd_snapshots)
 
     sp = sub.add_parser("list", help="List files in a snapshot.")
-    sp.add_argument("repo")
+    sp.add_argument("vault", help="Path to the .hbv vault file")
     sp.add_argument("snapshot_id")
     sp.set_defaults(func=cmd_list)
 

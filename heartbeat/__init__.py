@@ -5,7 +5,7 @@ and network shares into password-protected, versioned vaults:
 
     crypto          AES-256-GCM encryption + PBKDF2 key derivation
     manifest        Snapshot / FileEntry data structures (JSON-serializable)
-    repository      Content-addressed object store on disk
+    repository      Single-file encrypted vault (SQLite-backed .hbv)
     backup_engine   Full + incremental backup logic
     restore_engine  File-level and full restore
     config          Persisted job configuration (~/.heartbeat/config.json)

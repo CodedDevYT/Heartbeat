@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
 
 from PySide6.QtCore import Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QAction, QFont, QGuiApplication, QKeySequence
@@ -429,7 +428,7 @@ class PasswordDialog(QDialog):
 
     @staticmethod
     def ask(parent: QWidget | None, confirm: bool = False,
-            title: str | None = None, vault_name: str | None = None) -> Optional[str]:
+            title: str | None = None, vault_name: str | None = None) -> str | None:
         dlg = PasswordDialog(parent, confirm=confirm, title=title, vault_name=vault_name)
         return dlg.password if dlg.exec() == QDialog.Accepted else None
 
@@ -478,10 +477,10 @@ class HelpDialog(QDialog):
         # -- Concept cards --
         self._add_card(layout,
             "1.  Vaults",
-            "A vault is an encrypted folder. When you create one, Heartbeat "
-            "turns any empty folder — on your disk, an external drive, or a "
-            "network share — into a safe container. Everything gets encrypted "
-            "with your password before it's written.",
+            "A vault is an encrypted .hbv file. When you create one, Heartbeat "
+            "creates a single file — on your disk, an external drive, or a "
+            "network share — that acts as a safe container. Everything gets "
+            "encrypted with your password before it's written.",
             "Your password is never stored. Don't lose it — without the "
             "password nobody can read the vault, not even you.",
             warning=True,
@@ -550,7 +549,7 @@ class HelpDialog(QDialog):
         # -- Storage + compatibility --
         self._add_card(layout,
             "What's stored where",
-            "The vault folder contains only encrypted data. The app's own "
+            "The vault .hbv file contains only encrypted data. The app's own "
             "settings live in ~/.heartbeat/ (no passwords, no vault contents).",
         )
         self._add_card(layout,
@@ -807,12 +806,12 @@ class BackupTab(QWidget):
         v.setSpacing(10)
         v.addWidget(_step_label(2, "Where should the encrypted backup go?"))
         v.addWidget(_helper_text(
-            "Pick an empty folder as your Vault, or reuse an existing one. "
-            "Everything Heartbeat writes there is encrypted with your password."
+            "Pick an existing .hbv vault file or choose a location for a new one. "
+            "Everything Heartbeat writes is encrypted with your password."
         ))
         row = QHBoxLayout()
         self.repo_edit = QLineEdit()
-        self.repo_edit.setPlaceholderText("e.g. /Volumes/BackupDrive/MyVault")
+        self.repo_edit.setPlaceholderText("e.g. /Volumes/BackupDrive/MyVault.hbv")
         self.repo_edit.textChanged.connect(self._update_button_state)
         btn_browse = QPushButton("Browse…")
         btn_browse.setObjectName("ghost")
@@ -822,7 +821,7 @@ class BackupTab(QWidget):
         v.addLayout(row)
 
         row2 = QHBoxLayout()
-        self.btn_init = QPushButton("Create new vault here")
+        self.btn_init = QPushButton("Create new vault")
         self.btn_init.setObjectName("ghost")
         self.btn_init.clicked.connect(self._init_repo)
         row2.addWidget(self.btn_init)
@@ -897,24 +896,33 @@ class BackupTab(QWidget):
             self.source_edit.setText(d)
 
     def _pick_repo(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Choose a Vault folder")
-        if d:
-            self.repo_edit.setText(d)
+        f, _ = QFileDialog.getSaveFileName(
+            self, "Choose a vault file",
+            "", "Heartbeat Vault (*.hbv);;All Files (*)",
+            options=QFileDialog.DontConfirmOverwrite,
+        )
+        if f:
+            if not f.lower().endswith(".hbv"):
+                f += ".hbv"
+            self.repo_edit.setText(f)
 
     def _init_repo(self) -> None:
         repo_path = self.repo_edit.text().strip()
         if not repo_path:
             QMessageBox.information(
                 self, "Heartbeat",
-                "First pick a folder above (Step 2) that will become the Vault, "
-                "then click 'Create new vault here'."
+                "First pick a location above (Step 2) for the vault file, "
+                "then click 'Create new vault'."
             )
             return
-        if Path(repo_path).exists() and next(Path(repo_path).iterdir(), None) is not None:
+        if not repo_path.lower().endswith(".hbv"):
+            repo_path += ".hbv"
+            self.repo_edit.setText(repo_path)
+        if Path(repo_path).exists():
             QMessageBox.warning(
                 self, "Heartbeat",
-                "That folder isn't empty. Pick a different (empty or non-existent) "
-                "folder to create a new vault."
+                "A file already exists at that location. Pick a different name "
+                "or open the existing vault."
             )
             return
         pw = PasswordDialog.ask(self, confirm=True, vault_name=repo_path)
@@ -937,7 +945,7 @@ class BackupTab(QWidget):
         repo_path = self.repo_edit.text().strip()
         if not source or not repo_path:
             return
-        if not Path(repo_path).exists() or not (Path(repo_path) / "repo.json").exists():
+        if not Path(repo_path).exists() or not Repository.is_vault(repo_path):
             r = QMessageBox.question(
                 self, "Heartbeat",
                 "There's no vault at that location yet. Create one now?",
@@ -1055,6 +1063,7 @@ class RestoreTab(QWidget):
         self._repo_path: str = ""
         self._snapshot_cache: dict = {}
         self._current_entries: list = []
+        self._loading_files: bool = False
         self._worker: RestoreWorker | None = None
         self._thread = None
         self._build()
@@ -1071,11 +1080,11 @@ class RestoreTab(QWidget):
         v.setSpacing(10)
         v.addWidget(_step_label(1, "Open a vault"))
         v.addWidget(_helper_text(
-            "Point at the vault folder you used when backing up, and enter its password."
+            "Pick the .hbv vault file you used when backing up, and enter its password."
         ))
         row = QHBoxLayout()
         self.repo_edit = QLineEdit()
-        self.repo_edit.setPlaceholderText("Vault folder")
+        self.repo_edit.setPlaceholderText("Vault file (.hbv)")
         btn = QPushButton("Browse…")
         btn.setObjectName("ghost")
         btn.clicked.connect(self._pick_repo)
@@ -1201,18 +1210,21 @@ class RestoreTab(QWidget):
     # --- actions ---
 
     def _pick_repo(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Pick a vault folder")
-        if d:
-            self.repo_edit.setText(d)
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Pick a vault file",
+            "", "Heartbeat Vault (*.hbv);;All Files (*)",
+        )
+        if f:
+            self.repo_edit.setText(f)
 
     def _open_repo(self) -> None:
         repo_path = self.repo_edit.text().strip()
         if not repo_path:
-            QMessageBox.information(self, "Heartbeat", "Pick a vault folder first.")
+            QMessageBox.information(self, "Heartbeat", "Pick a vault file first.")
             return
-        if not (Path(repo_path) / "repo.json").exists():
+        if not Repository.is_vault(repo_path):
             QMessageBox.warning(self, "Heartbeat",
-                                "That folder isn't a Heartbeat vault.")
+                                "That file isn't a Heartbeat vault.")
             return
         pw = PasswordDialog.ask(self, vault_name=repo_path)
         if pw is None:
@@ -1287,34 +1299,24 @@ class RestoreTab(QWidget):
         return item.data(Qt.UserRole)
 
     def _load_files_for_selected(self) -> None:
-        """Called when the user clicks a row in the versions table.
-        Loads the snapshot manifest (from cache if available) and
-        fills the files table with its entries.
-
-        Note: version stats (mode, files, size) are already filled by
-        _populate_versions, so we only need to render the file list.
-        We must NOT call setText on the versions table here — doing so
-        while sorting is enabled triggers a re-sort which fires
-        itemSelectionChanged again, causing infinite recursion.
-        """
-        if self._repo is None:
+        """Called when the user clicks a row in the versions table."""
+        if self._repo is None or self._loading_files:
             return
-        sid = self._selected_snapshot_id()
-        if sid is None:
-            return
-        snap = self._load_snapshot(sid)
-        self._current_entries = list(snap.entries)
-        self._render_files(self._current_entries)
+        self._loading_files = True
+        try:
+            sid = self._selected_snapshot_id()
+            if sid is None:
+                return
+            snap = self._load_snapshot(sid)
+            self._current_entries = list(snap.entries)
+            self._render_files(self._current_entries)
+        finally:
+            self._loading_files = False
 
     def _render_files(self, entries: list) -> None:
-        """Fill the files table with the entries from a snapshot.
-
-        Sorting and visual updates are disabled while we bulk-fill
-        the table, otherwise Qt re-sorts and repaints after every
-        single setItem() call — that freezes the UI on snapshots
-        with thousands of files.
-        """
+        """Fill the files table with the entries from a snapshot."""
         t = self.files_table
+        t.blockSignals(True)
         t.setSortingEnabled(False)
         t.setUpdatesEnabled(False)
         t.setRowCount(len(entries))
@@ -1330,6 +1332,7 @@ class RestoreTab(QWidget):
             t.setItem(i, 2, mtime_item)
         t.setUpdatesEnabled(True)
         t.setSortingEnabled(True)
+        t.blockSignals(False)
 
     def _apply_filter(self, text: str) -> None:
         needle = text.lower().strip()
@@ -1455,20 +1458,12 @@ class JobEditorDialog(QDialog):
     """Dialog for creating or editing a backup job.
 
     The dialog is split into three sections:
-      1. **General** — job name, source folder, vault folder, backup mode.
+      1. **General** — job name, source folder, vault file, backup mode.
       2. **Schedule** — four scheduling modes (manual, interval, daily, weekly).
       3. **Password** — prompt every time vs. save in the OS keychain.
 
     Every section lives inside a styled "card" (rounded rectangle) so the
     form never feels like a dense spreadsheet.
-
-    Design patterns used:
-      - QFormLayout for the label + field pairs (General section).
-      - QRadioButton groups so exactly one option is selected per card.
-      - QFileDialog.getExistingDirectory for native folder pickers.
-      - Live validation: a helper label at the bottom updates as the user
-        types, and the Save button stays disabled until all required fields
-        are filled.
     """
 
     # Minimum width for text inputs so placeholders are readable.
@@ -1500,9 +1495,9 @@ class JobEditorDialog(QDialog):
         heading.setObjectName("h2")
         outer.addWidget(heading)
         intro = QLabel(
-            "Jobs save a source and vault together so you can run the same "
-            "backup again with one click. Schedule it to run automatically "
-            "while the app is open."
+            "Jobs save a source folder and vault file together so you can run "
+            "the same backup again with one click. Schedule it to run "
+            "automatically while the app is open."
         )
         intro.setObjectName("muted")
         intro.setWordWrap(True)
@@ -1536,12 +1531,11 @@ class JobEditorDialog(QDialog):
         src_row = self._path_row(self.source_edit, self._pick_source)
         form.addRow(QLabel("Source folder"), src_row)
 
-        # Vault row — text field + Browse + optional "reuse from…" dropdown.
         self.repo_edit = QLineEdit(job.repo if job else "")
-        self.repo_edit.setPlaceholderText("An empty folder, or an existing vault")
+        self.repo_edit.setPlaceholderText("Path to a .hbv vault file")
         self.repo_edit.setMinimumWidth(self._INPUT_MIN_W)
         vault_row = self._vault_row()
-        form.addRow(QLabel("Vault folder"), vault_row)
+        form.addRow(QLabel("Vault file"), vault_row)
 
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("Quick (only changed files) — recommended", "incremental")
@@ -1620,7 +1614,7 @@ class JobEditorDialog(QDialog):
         return w
 
     def _vault_row(self) -> QWidget:
-        """Vault path field + Browse button + optional "reuse vault" dropdown."""
+        """Vault file field + Browse button + optional "reuse vault" dropdown."""
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
@@ -1659,9 +1653,15 @@ class JobEditorDialog(QDialog):
             self.source_edit.setText(d)
 
     def _pick_vault(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Choose vault folder")
-        if d:
-            self.repo_edit.setText(d)
+        f, _ = QFileDialog.getSaveFileName(
+            self, "Choose vault file",
+            "", "Heartbeat Vault (*.hbv);;All Files (*)",
+            options=QFileDialog.DontConfirmOverwrite,
+        )
+        if f:
+            if not f.lower().endswith(".hbv"):
+                f += ".hbv"
+            self.repo_edit.setText(f)
 
     # ------------------------------------------------------------------
     # Live validation — the hint label updates as the user types.
@@ -1677,10 +1677,10 @@ class JobEditorDialog(QDialog):
         if src and not Path(src).exists():
             messages.append("Source folder doesn't exist yet.")
         if repo:
-            if (Path(repo) / "repo.json").exists():
+            if Repository.is_vault(repo):
                 messages.append("Vault detected — backups will be added to this vault.")
-            elif Path(repo).exists() and next(Path(repo).iterdir(), None) is not None:
-                messages.append("Vault folder isn't empty and isn't a vault — choose an empty folder.")
+            elif Path(repo).exists():
+                messages.append("File exists but isn't a vault — choose a different path.")
             else:
                 messages.append("New vault will be created here on first run.")
         self.hint.setText("  ·  ".join(messages))
@@ -1976,9 +1976,9 @@ class JobsTab(QWidget):
         h.setObjectName("h2")
         v.addWidget(h)
         v.addWidget(_helper_text(
-            "A job pairs a source folder with a vault. Select any row to edit, "
-            "delete, or run it. Schedule a job to repeat automatically while "
-            "the app is open."
+            "A job pairs a source folder with a vault file. Select any row to "
+            "edit, delete, or run it. Schedule a job to repeat automatically "
+            "while the app is open."
         ))
         layout.addWidget(intro_card)
 
@@ -2415,7 +2415,8 @@ class MainWindow(QMainWindow):
         self._tray.show()
 
     def _on_tray_activated(self, reason) -> None:
-        self._toggle_visibility()
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_visibility()
 
     def _toggle_visibility(self) -> None:
         """Toggle the main window between visible and hidden.
